@@ -1,0 +1,270 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/PuerkitoBio/goquery"
+)
+
+// ScraperConfig holds configuration for the scraper
+type ScraperConfig struct {
+	UserAgent string
+	Delay     time.Duration
+	Timeout   time.Duration
+}
+
+// WebScraper represents our scraper with configuration
+type WebScraper struct {
+	client *http.Client
+	config ScraperConfig
+}
+
+// ScrapedData represents the structure of scraped data
+type ScrapedData struct {
+	Title       string
+	Description string
+	Links       []string
+	Headings    []string
+}
+
+// NewWebScraper creates a new web scraper instance
+func NewWebScraper(config ScraperConfig) *WebScraper {
+	return &WebScraper{
+		client: &http.Client{
+			Timeout: config.Timeout,
+		},
+		config: config,
+	}
+}
+
+// Scrape performs web scraping on the given URL
+func (ws *WebScraper) Scrape(url string) (*ScrapedData, error) {
+	// Add delay to be respectful to the server
+	if ws.config.Delay > 0 {
+		time.Sleep(ws.config.Delay)
+	}
+
+	// Create request with custom user agent
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("User-Agent", ws.config.UserAgent)
+
+	// Make the request
+	resp, err := ws.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch URL: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check if request was successful
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
+	}
+
+	// Parse the HTML document
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse HTML: %w", err)
+	}
+
+	// Extract data
+	data := &ScrapedData{}
+
+	// Extract title
+	data.Title = strings.TrimSpace(doc.Find("title").Text())
+
+	// Extract meta description
+	data.Description, _ = doc.Find("meta[name='description']").Attr("content")
+
+	// Extract all links
+	doc.Find("a[href]").Each(func(i int, s *goquery.Selection) {
+		if href, exists := s.Attr("href"); exists {
+			data.Links = append(data.Links, href)
+		}
+	})
+
+	// Extract headings (h1, h2, h3)
+	doc.Find("h1, h2, h3").Each(func(i int, s *goquery.Selection) {
+		heading := strings.TrimSpace(s.Text())
+		if heading != "" {
+			data.Headings = append(data.Headings, heading)
+		}
+	})
+
+	return data, nil
+}
+
+// ScrapeMultiple scrapes multiple URLs concurrently
+func (ws *WebScraper) ScrapeMultiple(urls []string) map[string]*ScrapedData {
+	results := make(map[string]*ScrapedData)
+	resultChan := make(chan struct {
+		url  string
+		data *ScrapedData
+		err  error
+	}, len(urls))
+
+	// Launch goroutines for concurrent scraping
+	for _, url := range urls {
+		go func(u string) {
+			data, err := ws.Scrape(u)
+			resultChan <- struct {
+				url  string
+				data *ScrapedData
+				err  error
+			}{u, data, err}
+		}(url)
+	}
+
+	// Collect results
+	for i := 0; i < len(urls); i++ {
+		result := <-resultChan
+		if result.err != nil {
+			log.Printf("Error scraping %s: %v", result.url, result.err)
+		} else {
+			results[result.url] = result.data
+		}
+	}
+
+	return results
+}
+
+// Example function to scrape news headlines
+func (ws *WebScraper) ScrapeNewsHeadlines(url string) ([]string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("User-Agent", ws.config.UserAgent)
+
+	resp, err := ws.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var headlines []string
+
+	// Common selectors for news headlines
+	selectors := []string{
+		"h1", "h2", "h3",
+		".headline", ".title",
+		"[class*='headline']", "[class*='title']",
+	}
+
+	for _, selector := range selectors {
+		doc.Find(selector).Each(func(i int, s *goquery.Selection) {
+			text := strings.TrimSpace(s.Text())
+			if text != "" && len(text) > 10 { // Filter out very short text
+				headlines = append(headlines, text)
+			}
+		})
+	}
+
+	return headlines, nil
+}
+
+func main() {
+	// Configure the scraper
+	config := ScraperConfig{
+		UserAgent: "Mozilla/5.0 (compatible; GoScraper/1.0)",
+		Delay:     1 * time.Second, // Be respectful - 1 second delay between requests
+		Timeout:   30 * time.Second,
+	}
+
+	scraper := NewWebScraper(config)
+
+	// Example 1: Scrape a single website
+	fmt.Println("=== Single Website Scraping ===")
+	url := "https://example.com"
+	data, err := scraper.Scrape(url)
+	if err != nil {
+		log.Printf("Error scraping %s: %v", url, err)
+	} else {
+		fmt.Printf("Title: %s\n", data.Title)
+		fmt.Printf("Description: %s\n", data.Description)
+		fmt.Printf("Number of links: %d\n", len(data.Links))
+		fmt.Printf("Headings: %v\n", data.Headings)
+	}
+
+	fmt.Println("\n=== Multiple Website Scraping ===")
+	// Example 2: Scrape multiple websites concurrently
+	urls := []string{
+		"https://example.com",
+		"https://httpbin.org/html",
+		"https://golang.org",
+	}
+
+	results := scraper.ScrapeMultiple(urls)
+	for url, data := range results {
+		fmt.Printf("\nURL: %s\n", url)
+		if data != nil {
+			fmt.Printf("  Title: %s\n", data.Title)
+			fmt.Printf("  Links found: %d\n", len(data.Links))
+		}
+	}
+
+	// Example 3: Scrape news headlines (you would replace with actual news site)
+	fmt.Println("\n=== News Headlines Example ===")
+	headlines, err := scraper.ScrapeNewsHeadlines("https://example.com")
+	if err != nil {
+		log.Printf("Error scraping headlines: %v", err)
+	} else {
+		fmt.Printf("Found %d headlines\n", len(headlines))
+		for i, headline := range headlines {
+			if i < 5 { // Show first 5
+				fmt.Printf("  - %s\n", headline)
+			}
+		}
+	}
+}
+
+// Additional utility functions
+
+// IsValidURL checks if a URL is valid and accessible
+func IsValidURL(url string) bool {
+	resp, err := http.Get(url)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
+}
+
+// ExtractEmails extracts email addresses from text using regex
+func ExtractEmails(text string) []string {
+	emailPattern := `[a-zA-Z0-9._%%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}`
+	re := regexp.MustCompile(emailPattern)
+	return re.FindAllString(text, -1)
+}
+
+// SaveToFile saves scraped data to a file as JSON
+func SaveToFile(filename string, data interface{}) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer file.Close()
+
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "  ")
+	if err := encoder.Encode(data); err != nil {
+		return fmt.Errorf("failed to encode data as JSON: %w", err)
+	}
+	return nil
+}
